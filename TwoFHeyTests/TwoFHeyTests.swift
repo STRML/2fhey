@@ -7,6 +7,8 @@
 //
 
 import XCTest
+import Network
+import CryptoKit
 @testable import _FHey
 
 class OTPParserTests: XCTestCase {
@@ -131,5 +133,319 @@ class OTPParserTests: XCTestCase {
     func testMessagesWithoutKeywordsAreIgnored() {
         assertNoCode("Hey, meet me at 123456 Main St")
         assertNoCode("Running 15 minutes late, sorry!")
+    }
+}
+
+// MARK: - NotificationServer
+
+/// The Google Messages bridge listens on a local port. Any web page the user opens can reach
+/// that port, so the server must refuse foreign origins and must not listen beyond loopback.
+final class NotificationServerTests: XCTestCase {
+    private static var nextPort: UInt16 = 28470
+
+    private var server: NotificationServer!
+    private var port: UInt16 = 0
+    private var received: [(title: String, body: String)] = []
+
+    override func setUp() {
+        super.setUp()
+        Self.nextPort += 1
+        port = Self.nextPort
+        received = []
+        server = NotificationServer(port: port, allowTLS: false)
+        server.onNotificationReceived = { [weak self] title, body, _ in
+            self?.received.append((title, body))
+        }
+        server.start()
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+
+    override func tearDown() {
+        server.stop()
+        super.tearDown()
+    }
+
+    /// Sends one raw HTTP request to `host` and returns whatever comes back first.
+    private func send(_ request: String, host: String = "127.0.0.1", timeout: TimeInterval = 3) -> String? {
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        let done = DispatchSemaphore(value: 0)
+        var response: String?
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                connection.send(content: request.data(using: .utf8), completion: .contentProcessed { _ in })
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
+                    response = data.flatMap { String(data: $0, encoding: .utf8) }
+                    done.signal()
+                }
+            case .failed, .cancelled:
+                done.signal()
+            default:
+                break
+            }
+        }
+        connection.start(queue: .global())
+        _ = done.wait(timeout: .now() + timeout)
+        connection.cancel()
+        return response
+    }
+
+    private func post(origin: String?, body: String = #"{"title":"Bank","body":"Your code is 123456"}"#) -> String? {
+        var lines = ["POST /notification HTTP/1.1", "Host: 127.0.0.1:\(port)", "Content-Type: application/json"]
+        if let origin { lines.append("Origin: \(origin)") }
+        lines.append("Content-Length: \(body.utf8.count)")
+        return send(lines.joined(separator: "\r\n") + "\r\n\r\n" + body)
+    }
+
+    private func upgrade(origin: String?) -> String? {
+        var lines = ["GET / HTTP/1.1", "Host: 127.0.0.1:\(port)", "Upgrade: websocket", "Connection: Upgrade",
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version: 13"]
+        if let origin { lines.append("Origin: \(origin)") }
+        return send(lines.joined(separator: "\r\n") + "\r\n\r\n")
+    }
+
+    private func drainMainQueue() {
+        let flushed = expectation(description: "main queue flushed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { flushed.fulfill() }
+        wait(for: [flushed], timeout: 2)
+    }
+
+    func testForeignOriginPostIsRejected() {
+        let response = post(origin: "https://evil.example")
+        XCTAssertTrue(response?.hasPrefix("HTTP/1.1 403") == true, "got: \(response ?? "nil")")
+        drainMainQueue()
+        XCTAssertTrue(received.isEmpty)
+    }
+
+    func testLookalikeOriginIsRejected() {
+        for origin in ["https://messages.google.com.evil.example", "http://messages.google.com", "null"] {
+            let response = post(origin: origin)
+            XCTAssertTrue(response?.hasPrefix("HTTP/1.1 403") == true, "\(origin) got: \(response ?? "nil")")
+        }
+        drainMainQueue()
+        XCTAssertTrue(received.isEmpty)
+    }
+
+    func testForeignOriginWebSocketUpgradeIsRejected() {
+        let response = upgrade(origin: "https://evil.example")
+        XCTAssertTrue(response?.hasPrefix("HTTP/1.1 403") == true, "got: \(response ?? "nil")")
+    }
+
+    func testGoogleMessagesOriginWebSocketUpgradeIsAccepted() {
+        let response = upgrade(origin: "https://messages.google.com")
+        XCTAssertTrue(response?.hasPrefix("HTTP/1.1 101") == true, "got: \(response ?? "nil")")
+    }
+
+    func testOriginlessPostStillWorksForCurlTesting() {
+        let response = post(origin: nil)
+        XCTAssertTrue(response?.hasPrefix("HTTP/1.1 200") == true, "got: \(response ?? "nil")")
+        drainMainQueue()
+        XCTAssertEqual(received.first?.title, "Bank")
+    }
+
+    func testResponsesCarryNoWildcardCORSHeader() {
+        let response = post(origin: nil) ?? ""
+        XCTAssertFalse(response.lowercased().contains("access-control-allow-origin"), response)
+    }
+
+    /// Reads the kernel's view of the listening socket, because dialing the machine's own LAN
+    /// address from the test host is blocked by macOS and would pass whatever the server does.
+    func testListensOnLoopbackOnly() throws {
+        let lsof = Process()
+        lsof.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        lsof.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-Fn"]
+        let pipe = Pipe()
+        lsof.standardOutput = pipe
+        try lsof.run()
+        lsof.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        let addresses = output.split(separator: "\n").filter { $0.hasPrefix("n") }.map { String($0.dropFirst()) }
+        XCTAssertFalse(addresses.isEmpty, "nothing is listening on \(port)")
+        for address in addresses {
+            XCTAssertTrue(address.hasPrefix("127.0.0.1:") || address.hasPrefix("[::1]:"),
+                          "listening beyond loopback: \(address)")
+        }
+    }
+}
+
+// MARK: - Google Messages DMG
+
+/// The Google Messages app is ad-hoc signed, so the download is only trustworthy if it matches the
+/// pinned checksum. Nothing may reach the mount and copy steps otherwise.
+final class GoogleMessagesDMGTests: XCTestCase {
+    private var directory: URL!
+    private let downloadedCopy = NSTemporaryDirectory() + "Google-Messages.dmg"
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(atPath: downloadedCopy)
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(atPath: downloadedCopy)
+    }
+
+    private func served(_ contents: String) throws -> (url: URL, sha256: String) {
+        let url = directory.appendingPathComponent("Google-Messages.dmg")
+        let data = Data(contents.utf8)
+        try data.write(to: url)
+        let sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return (url, sha256)
+    }
+
+    func testDownloadMatchingThePinIsAccepted() async throws {
+        let file = try served("genuine disk image")
+        let path = try await GoogleMessagesSetupService(dmgURL: file.url, expectedSHA256: file.sha256).downloadDMG()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+    }
+
+    func testPinMatchIgnoresHexCase() async throws {
+        let file = try served("genuine disk image")
+        let path = try await GoogleMessagesSetupService(dmgURL: file.url, expectedSHA256: file.sha256.uppercased()).downloadDMG()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+    }
+
+    func testTamperedDownloadIsRejectedAndNotLeftOnDisk() async throws {
+        let file = try served("swapped by an attacker")
+        let genuine = String(repeating: "0", count: 64)
+        do {
+            _ = try await GoogleMessagesSetupService(dmgURL: file.url, expectedSHA256: genuine).downloadDMG()
+            XCTFail("a download that does not match the pin was accepted")
+        } catch GoogleMessagesSetupError.checksumMismatch {
+            // expected
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: downloadedCopy))
+    }
+
+    func testPublishedPinIsAWellFormedSHA256() {
+        XCTAssertNotNil(GoogleMessagesSetupService.pinnedDMGSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression))
+    }
+}
+
+// MARK: - Remote pattern updates
+
+/// Pattern files are fetched from GitHub at runtime and cached on disk, where they outlive the
+/// session. A file that is huge, or holds a regex that backtracks catastrophically, would freeze
+/// the app on every incoming message, so such a file must never reach the cache.
+final class RemotePatternTests: XCTestCase {
+    private final class StubProtocol: URLProtocol {
+        static var bodies: [String: Data] = [:]
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            let url = request.url!
+            let body = Self.bodies[url.lastPathComponent]
+            let response = HTTPURLResponse(url: url, statusCode: body == nil ? 404 : 200, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body ?? Data())
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
+    private var cache: URL!
+    private var parser: OTPParser!
+
+    override func setUpWithError() throws {
+        cache = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        StubProtocol.bodies = [:]
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubProtocol.self]
+        parser = OTPParser(remoteBaseURL: URL(string: "https://patterns.test/OTPKeywords")!,
+                           cacheDirectory: cache,
+                           session: URLSession(configuration: configuration),
+                           refreshOnInit: false)
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: cache)
+    }
+
+    private func languageFile(keywords: [String] = ["code"], patterns: [String] = [#"\b\d{6}\b"#]) -> Data {
+        try! JSONSerialization.data(withJSONObject: ["keywords": keywords, "patterns": patterns])
+    }
+
+    private func customFile(patterns: [String]) -> Data {
+        let entries = patterns.map { ["service": "Example", "pattern": $0] }
+        return try! JSONSerialization.data(withJSONObject: ["customPatterns": entries])
+    }
+
+    private func isCached(_ name: String) -> Bool {
+        FileManager.default.fileExists(atPath: cache.appendingPathComponent(name).path)
+    }
+
+    private func assertRejected(_ body: Data, as name: String = "en.json", _ message: String,
+                                file: StaticString = #filePath, line: UInt = #line) async {
+        StubProtocol.bodies[name] = body
+        await parser.refreshFromRemote()
+        XCTAssertFalse(isCached(name), message, file: file, line: line)
+    }
+
+    func testWellFormedUpdateIsCached() async {
+        StubProtocol.bodies["en.json"] = languageFile()
+        await parser.refreshFromRemote()
+        XCTAssertTrue(isCached("en.json"))
+    }
+
+    func testBundledFilesPassTheSameChecks() async throws {
+        let bundle = Bundle(for: OTPParser.self)
+        for name in ["en", "fr", "zh", "es", "de", "pt", "he", "custom-patterns"] {
+            let url = try XCTUnwrap(bundle.url(forResource: name, withExtension: "json", subdirectory: "OTPKeywords")
+                                    ?? bundle.url(forResource: name, withExtension: "json"), name)
+            StubProtocol.bodies["\(name).json"] = try Data(contentsOf: url)
+        }
+        await parser.refreshFromRemote()
+        for name in ["en", "fr", "zh", "es", "de", "pt", "he", "custom-patterns"] {
+            XCTAssertTrue(isCached("\(name).json"), "\(name).json was rejected")
+        }
+    }
+
+    func testOversizedFileIsRejected() async {
+        await assertRejected(languageFile(keywords: [String(repeating: "a", count: 200_000)]), "200 KB file was cached")
+    }
+
+    func testTooManyEntriesAreRejected() async {
+        await assertRejected(languageFile(patterns: Array(repeating: #"\d{6}"#, count: 500)), "500 patterns were cached")
+        await assertRejected(languageFile(keywords: Array(repeating: "code", count: 500)), "500 keywords were cached")
+    }
+
+    func testOverlongPatternIsRejected() async {
+        await assertRejected(languageFile(patterns: [String(repeating: "a", count: 2_000)]), "2,000 character pattern was cached")
+    }
+
+    func testCatastrophicBacktrackingPatternsAreRejected() async {
+        for pattern in ["(a+)+$", #"(\d+)*x"#, "(a|aa)+$", #"(?:\d{3,})+z"#, #"(.*a)+x"#] {
+            await assertRejected(languageFile(patterns: [pattern]), "\(pattern) was cached")
+            await assertRejected(customFile(patterns: [pattern]), as: "custom-patterns.json", "\(pattern) was cached as a custom pattern")
+        }
+    }
+
+    func testHarmlessLookalikesAreStillAccepted() async {
+        // An escaped parenthesis, a parenthesis inside a character class, and a group with a bounded repeat.
+        StubProtocol.bodies["en.json"] = languageFile(patterns: [#"code\)+ (\d{6})"#, #"[)]+(\d{6})"#, #"(\d{3}){2}"#])
+        await parser.refreshFromRemote()
+        XCTAssertTrue(isCached("en.json"))
+    }
+
+    func testOneBadFileDoesNotBlockTheGoodOnes() async {
+        StubProtocol.bodies["en.json"] = languageFile(patterns: ["(a+)+$"])
+        StubProtocol.bodies["fr.json"] = languageFile()
+        await parser.refreshFromRemote()
+        XCTAssertFalse(isCached("en.json"))
+        XCTAssertTrue(isCached("fr.json"))
+    }
+
+    func testRejectedUpdateLeavesThePreviousCachedCopyAlone() async throws {
+        let previous = languageFile(keywords: ["previous"])
+        try previous.write(to: cache.appendingPathComponent("en.json"))
+        StubProtocol.bodies["en.json"] = languageFile(patterns: ["(a+)+$"])
+        await parser.refreshFromRemote()
+        XCTAssertEqual(try Data(contentsOf: cache.appendingPathComponent("en.json")), previous)
     }
 }
